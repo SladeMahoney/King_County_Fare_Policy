@@ -1,0 +1,388 @@
+---
+title: "King County Fare Reinstatement Assessment"
+author: "Slade Mahoney & Emily Irion"
+date: "2023-02-24"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(sf)
+library(readr)
+#install.packages("tigris")
+options(tigris_use_cache = TRUE)
+library(tigris)
+#install.packages("plotly")
+library(plotly)
+#install.packages("ggpubr")
+#library(ggpubr)
+library(dplyr)
+library(here)
+library(RColorBrewer)
+library(tidyr)
+```
+
+## Teaser
+
+This document contains the code for Group 1's analysis of the King County Fare Reinstatement Question
+
+## Load and Merge the Data 
+
+Data was provided from King County Metro, the American Community Survey, and spatial data for bus stops and census tract were given to us by our professor. 
+
+# Load and Merge the Spatial Data 
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+# Load in Data
+#Load 5% Sample
+Route_Level <-read_csv(here("data-raw","fivepctsample_stop_activity_granular_2020-09-01_2020-10-31-001.csv")) 
+
+# Create a dummy for rides that take off in the morning between 4am and 12 noon
+Route_Level$Morning_Board <- ifelse(Route_Level$ACTUAL_DEPARTURE_SECS_AFTER_MIDNT >= 50000 & Route_Level$ACTUAL_DEPARTURE_SECS_AFTER_MIDNT <= 120000, 1, 0)
+
+sum(Route_Level$Morning_Board)
+
+# Create another dummy for rides that arrive in the evening. This will help us determine where people live when they are departing the train. Control for hours between 3-7pm normal times to get home
+Route_Level$Night_Board <- ifelse(Route_Level$ACTUAL_ARRIVAL_SECS_AFTER_MIDNT >= 150000 & Route_Level$ACTUAL_ARRIVAL_SECS_AFTER_MIDNT <= 200000, 1, 0)
+sum(Route_Level$Night_Board)
+
+# Count the real number of passengers getting on and off in an 
+Route_Level$Real_Stop_Boardings <- ifelse(Route_Level$Morning_Board == 1, Route_Level$PSNGR_BOARDINGS, 0)
+Route_Level$Real_Stop_Alightings <- ifelse(Route_Level$Night_Board == 1, Route_Level$PSNGR_ALIGHTINGS, 0)
+
+#Load Route-level APC Data
+APC <- read_csv(here("data-raw","apc_detailed_09-01-2020_10-31-2020.csv"))
+# Load American Community Survey (ACS) - King County Dataset 
+acs <- read.csv(here("data-raw", "King_County_ACS_2019_tract.csv"))
+
+# Read KCM Stops shapefile 
+shapename <- read_sf(here("data-raw/KCM_Stops_Data/kcm_stops.shp"))
+
+Table_Name <- c("fivepctsample_stop_activity", "King_County_ACS_2019", "APC datafile", "Shp file - kcm_stops.shp")
+
+The_Unit_of_Analysis <- c("Each individual stop.", "Individual Census tracts", "average ridership by Trips by date", "Stops")
+
+Obtained_data <- c("automated passenger counts(APC) at the stop-level for Metro buses", "Features of socio-economic groups", "Schedule information", "geospatial coordinates")
+
+table_1 <- tibble(
+  Table_Name,
+  The_Unit_of_Analysis, Obtained_data
+)
+
+#----------------------------------
+# Step 1. set-up shp file for merge
+#----------------------------------
+
+#transform coordinates to CRS:4326
+library(sf)
+stops <- cbind(shapename, st_transform(x = shapename, crs = 4326) %>% st_coordinates) 
+
+#### load the census tract shape files for King County using the tigris package
+kctracts <- tigris::tracts(state = 53, county = 033, cb = FALSE, year = 2020)
+
+#### convert the data
+stops_sf <- st_as_sf(data.frame(x = stops$X, y = stops$Y), coords = c('x', 'y'), crs = st_crs(kctracts))
+
+#### create a new data frame that matches the bus stop data to the census tract
+stops_census <- stops_sf %>% mutate(
+  intersection = as.integer(st_intersects(geometry, kctracts)),
+  GEOID = as.numeric(if_else(is.na(intersection), '', kctracts$GEOID[intersection])),
+  STOP_ID = as.numeric(stops$STOP_ID),
+) 
+
+```
+
+
+# Clean the American Community Survey Data 
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+#----------------------------------
+# Step 2. Merging "stops_census" with fivepercent "dat1"
+#----------------------------------
+## Left Join 5% sample with the Stops_Census data using STOP_ID
+bus_stop <- left_join(Route_Level, stops_census, by = "STOP_ID")
+
+#----------------------------------
+# Step 3. Clean ACS Data by merging it with its codebook
+#----------------------------------
+
+#read codebook
+acs_codebook <- readxl::read_xlsx(here("data-raw", "ACS_Variables_Selected.xlsx")) |> 
+  mutate(Variable_Code = ifelse(Description == "Estimate!!Other languages!!English less than very weel", "B06007_008", Variable_Code))
+
+#transform to long form
+acs_long <- acs |> 
+  select(-ends_with("M"), -`X`) |>    # Removing MoE columns and excel row count column
+  pivot_longer(cols = -c(GEOID, NAME)) |> 
+  print()
+
+#delete E
+acs_long <- acs_long|> 
+  mutate(name = str_sub(name, end = -2)) %>% 
+  print() # Removing the E's at the end
+
+#merge codebook to data
+acs_long_desc <- acs_long |> 
+  rename(Variable_Code = name) |> 
+  left_join(acs_codebook, by = c("Variable_Code")) |> 
+  print()
+
+#arrange data
+acs_wide_desc <- acs_long_desc |>
+  filter(Description != "Total:") |> 
+  pivot_wider(id_cols = c("GEOID", "NAME"), # Variable(s) that form the wide data unit of analysis
+              names_from = "Description", # Variable(s) containing the names of wide variables
+              values_from = "value")      # Variable(s) containing values for each wide variable
+
+colnames(bus_stop)
+
+#----------------------------------
+# Step 4. Select specific columns
+#----------------------------------
+
+# Select specific bus stop columns
+bus_stop <- bus_stop |> 
+  select(STOP_ID, TRIP_ID, STOP_NM, STOP_SEQUENCE_NUM, OPERATION_DATE, 
+         PSNGR_BOARDINGS, PSNGR_ALIGHTINGS, Real_Stop_Boardings, Real_Stop_Alightings, GEOID, SCHED_DAY_TYPE_CODED_NUM) |> 
+  mutate(SCHED_DAY_TYPE_CODED_NUM=as.numeric(bus_stop$SCHED_DAY_TYPE_CODED_NUM))
+
+# Select specific acs columns that we will use to measure possible socioeconomic categories
+colnames(acs_wide_desc)
+acs_wide_desc <- acs_wide_desc |> 
+  select(GEOID, NAME, `Median age!!Total`, `Estimate!!Median household Income`, `Estimate!!Total`
+  )
+
+
+#----------------------------------
+# Step 5. Join Bus Stop and ACS Data
+#----------------------------------
+
+# Join the bus stop data and the ACS data
+data_cleaned <- left_join(bus_stop, acs_wide_desc, by="GEOID")
+
+# Export it to new data set 
+#write_csv(data_cleaned, "data_cleaned.csv")
+```
+
+
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+#----------------------------------
+# Step 6. Make date times for Data Cleaned
+#----------------------------------
+
+# Load in Cleaned Wide Data
+#Data <-read_csv(here("data_cleaned.csv")) 
+Data <- data_cleaned
+# Mark as 1 if in September for Pre and 1 if in October for Post
+library(data.table)
+setDT(Data)[, Post:=(as.Date(OPERATION_DATE, '%Y-%m-%d') %between%
+                       c('2020-10-1', '2020-10-31')) +0L] []
+setDT(Data)[, Pre:=(as.Date(OPERATION_DATE, '%Y-%m-%d') %between%
+                      c('2020-09-19', '2020-09-30')) +0L] []
+
+
+#----------------------------------
+# Step 7.Code in Weekend vs Weekday & Fare vs No Fare
+#----------------------------------
+# Filter out all data before September 19 & add a column for weekend vs weekday
+Data <-  subset(Data, Pre ==1 |
+                  Post == 1) |> 
+  mutate(Day = case_when(SCHED_DAY_TYPE_CODED_NUM == "0" ~ "Weekday",
+                         SCHED_DAY_TYPE_CODED_NUM == "1" ~ "Weekend",
+                         SCHED_DAY_TYPE_CODED_NUM == "2" ~ "Weekend",)) |> 
+  mutate(Intervention = case_when(Pre == 1 ~ "No_Fare",
+                                  Post == 1 ~ "Fare",))
+
+# Group by Operation Date to get Pre and Post Metrics
+By_Date <- Data |>
+  group_by(OPERATION_DATE, NAME, Day, Intervention) |> 
+  summarize(Total_Boardings = sum(Real_Stop_Boardings),
+          Total_Alightings =sum(Real_Stop_Alightings))
+
+dailytotal_riders<- By_Date |>  
+  group_by(OPERATION_DATE, Day, Intervention) |> 
+  summarize(mean_daily_alightings=sum(Total_Alightings),
+            mean_daily_boardings=sum(Total_Boardings))
+
+
+daily_mean_riders <- By_Date |> 
+  group_by(OPERATION_DATE, Day, Intervention) |> 
+  summarize(mean_daily_alightings=mean(Total_Alightings),
+            mean_daily_boardings=mean(Total_Boardings))
+
+# Separate by Weekend Pre and Post and Weekday Pre/Post
+Data_pre_wknd <- daily_mean_riders |> filter(Intervention == "Fare") |> filter(Day=="Weekend")  
+Data_pre_wk <- daily_mean_riders  |> filter(Intervention == "No_Fare") |> filter(Day=="Weekday")  
+Data_post_wknd <- daily_mean_riders  |> filter(Intervention == "Fare") |> filter(Day=="Weekend")  
+Data_post_wk <- daily_mean_riders  |> filter(Intervention == "Fare") |> filter(Day=="Weekday")  
+
+#----------------------------------
+# Step 8. Look at ridership trends per day for weekends and weekdays
+#----------------------------------
+# Look at the daily average total ridership for weekdays
+
+Pre_Alightings<- mean(Data_pre_wk $mean_daily_alightings)
+Post_Alightings <- mean(Data_post_wk $mean_daily_alightings)
+
+Pre_Boardings<- mean(Data_pre_wk $mean_daily_boardings)
+Post_Boardings<- mean(Data_post_wk $mean_daily_boardings)
+
+# Extra - don't need to include weekends in our tibble
+mean(Data_pre_wknd$Total_Alightings)
+mean(Data_post_wknd$Total_Alightings)
+
+mean(Data_pre_wknd$Total_Boardings)
+mean(Data_post_wknd$Total_Boardings)
+
+# Make a tibble of average daily ridership for weekdays 
+ridership_tibble <- tibble(Description = c("Alightings", "Boardings"), Pre = c(Pre_Alightings, Pre_Boardings), 
+                           Post = c(Post_Alightings, Post_Boardings))
+ridership_tibble
+
+# Only need to look at one of boards or alightings since they are counting the same folks. 
+```
+## Question 1: Did the Fare Reinstatement Affect Ridership in King County? 
+#Plot for Average Daily Ridership Before and After the Fare Reinstatement
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+#----------------------------------
+# Step 8.Create Preliminary Graphs
+#----------------------------------
+# Create one dataframe/tibble for all Weekday Daily Ridership Numbers 
+Data_graph <- bind_rows(Data_pre_wk, Data_post_wk)
+
+# Basic line plot with points
+p1<-ggplot(data=daily_mean_riders, aes(x=OPERATION_DATE, y=mean_daily_alightings)) +
+  geom_smooth(aes(color = "Average Daily Alightings"), se=FALSE)+
+  geom_vline(xintercept = as.Date("2020-10-01"), linetype="dashed")+
+  annotate("text", x = as.Date("2020-10-01") + 1, y = 8.75, label = "Fare Reinstatement", hjust = 0)+
+  xlab("Date")+
+  ylab("Average Daily Ridership")+
+  ggtitle("Average Daily Ridership") + 
+  theme(legend.position = "right",  panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(), panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), axis.title.x = element_text(margin = margin(t = 10)), axis.title.y = element_text(margin = margin(r = 10)))+
+  scale_color_brewer(palette = "Dark2")+
+  guides(color = guide_legend(title = NULL)) 
+
+ggsave("myplot1.png", p1)
+knitr::include_graphics("myplot1.png")
+```
+
+
+## Question 2: Did the Fare Reinstatement Disporportionately Affect Socio-Economic Groups?
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+#----------------------------------
+# Step 10. Analysis for Question 2 
+#----------------------------------
+# Step 1
+# Remove the rows that have no census tract data 
+sum(is.na(Data$`Median age!!Total`))
+
+# Drop Weekend ridership because we are not interested in it 
+Data <- Data[Data$Day != "Weekend"]
+
+# 248,536 rows do not have census tract data 
+
+# Remove all rows with NA in the Name row. This means there is no census tract data and we therefore cannot use it to accurately 
+# determine data on ridership trends between groups
+Data <- Data[complete.cases(Data$NAME), ]
+
+
+
+# Step 2: Create new DF with Summaries of all variables of interest  (means will give the totals for )
+Sum_data<- 
+  Data |>  group_by(GEOID, NAME, OPERATION_DATE) |> 
+  summarize(
+    total_real_passenger_boardings = sum(Real_Stop_Boardings),
+    total_real_passenger_alightings= sum(Real_Stop_Alightings),
+    median_hh_income = mean(`Estimate!!Median household Income`),
+    population = mean(`Estimate!!Total`),
+    n=n()
+  )
+
+
+# See what quintiles are best in King County 
+quintiles <- quantile(Sum_data$median_hh_income, probs = seq(0, 1, 0.2), na.rm = TRUE)
+quintiles
+
+# Set Quintiles at 56275,  90179, 111705, 125313, 152969, 250001 
+# These numbers are high for the United States, but in King County, median HH Incomes are higher than most. 
+# We decided to go with these levels because it is more representative of our population. 
+
+# Separate Groups by low, low-mid, middle, mid-high, and high income groups
+# Low income below $90,179
+low_income_by_date <- Sum_data %>%
+  group_by(OPERATION_DATE) %>%
+  filter(median_hh_income< 90179) |> 
+  summarize(mean_daily_alightings = mean(total_real_passenger_alightings)) |> 
+  mutate(group="Low Income")
+
+# Low-mid between $90,179 - 111,705
+low_mid_income_by_date <- Sum_data %>%
+  group_by(OPERATION_DATE) %>%
+  filter(median_hh_income >= 90179 & median_hh_income <111705) |> 
+  summarize(mean_daily_alightings = mean(total_real_passenger_alightings))|> 
+  mutate(group="Low-Mid Income")
+
+# Middle Income $111,705 - 125,313
+mid_income_by_date <- Sum_data %>%
+  group_by(OPERATION_DATE) %>%
+  filter(median_hh_income >= 111705 & median_hh_income <125313) |> 
+  summarize(mean_daily_alightings = mean(total_real_passenger_alightings))|> 
+  mutate(group="Middle Income")
+
+# Mid-High Income $125,313 - 152969
+mid_high_income_by_date <- Sum_data %>%
+  group_by(OPERATION_DATE) %>%
+  filter(median_hh_income >= 125313 & median_hh_income <152969) |> 
+  summarize(mean_daily_alightings = mean(total_real_passenger_alightings))|> 
+  mutate(group="Mid-High Income")
+
+# High Income above $152,969
+high_income_by_date <- Sum_data %>%
+  group_by(OPERATION_DATE) %>%
+  filter(median_hh_income >= 152969) |> 
+  summarize(mean_daily_alightings = mean(total_real_passenger_alightings))|> 
+  mutate(group="High Income")
+
+graph_data <- rbind(low_income_by_date, low_mid_income_by_date, mid_income_by_date, mid_high_income_by_date, high_income_by_date)
+
+group_levels <- c("High Income", "Mid-High Income", "Middle Income", "Low-Mid Income", "Low Income")
+
+
+# Use factor to set the levels in the desired order
+graph_data$group <- factor(graph_data$group, levels = group_levels)
+
+```
+
+# Plot of Average Daily Ridership by Income Level 
+
+```{r , echo=FALSE, warning=FALSE , message=FALSE, results='hide'}
+# Create a plot for Average Daily Ridership by Income Level 
+
+p2<- ggplot(data=graph_data, aes(x=OPERATION_DATE, y=mean_daily_alightings, color=group)) +
+   geom_smooth(se=FALSE)+
+  geom_vline(xintercept = as.Date("2020-10-01"), linetype="dashed")+
+  annotate("text", x = as.Date("2020-10-01") + 1, y = 6.2, label = "Fare Reinstatement", hjust = 0)+
+  xlab("Date")+
+  ylab("Average Daily Ridership")+
+  labs(color = "Group")+
+  ylim(3, 6.5)+  
+  scale_color_brewer(palette = "Dark2") +
+  ggtitle("Average Daily Ridership by Income Level") + 
+  guides(color = guide_legend(title = "Income Group"))+
+  theme(legend.position = "right", legend.box.background = element_rect(color = "black", size = 1), panel.grid.major = element_blank(),panel.grid.minor = element_blank(), panel.background = element_rect(fill = "white"), axis.line = element_line(colour = "black"), axis.title.x = element_text(margin = margin(t = 10)), axis.title.y = element_text(margin = margin(r = 10)))+
+  scale_color_brewer(palette = "Dark2")
+
+ggsave("myplot2.png", p2)
+
+knitr::include_graphics("myplot2.png")
+```
+
+```
+
+
